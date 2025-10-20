@@ -1,18 +1,323 @@
 const express = require('express');
 const zlib = require('zlib');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const path = require('path');
+require('dotenv').config();
+
+const { clientOps, leadOps, activityOps } = require('./database');
+const { authenticateToken, generateToken } = require('./middleware/auth');
+
 const app = express();
 
-// Enable CORS für n8n
+// Enable CORS
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ limit: '50mb' }));
 
+// Serve static files from React build
+app.use(express.static(path.join(__dirname, 'client/build')));
+
+// ==================== AUTHENTICATION ENDPOINTS ====================
+
+// Register new client (for admin use)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, company } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Name, email, and password are required' });
+    }
+
+    // Check if client already exists
+    const existingClient = clientOps.findByEmail.get(email);
+    if (existingClient) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create client
+    const result = clientOps.create.run(name, email, hashedPassword, company || '');
+    const client = clientOps.findById.get(result.lastInsertRowid);
+
+    res.status(201).json({
+      message: 'Client registered successfully',
+      client: { id: client.id, name: client.name, email: client.email, company: client.company }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed', message: error.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Find client
+    const client = clientOps.findByEmail.get(email);
+    if (!client) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Verify password
+    const validPassword = await bcrypt.compare(password, client.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate token
+    const token = generateToken(client);
+
+    res.json({
+      token,
+      client: {
+        id: client.id,
+        name: client.name,
+        email: client.email,
+        company: client.company
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed', message: error.message });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+  try {
+    const client = clientOps.findById.get(req.user.id);
+    if (!client) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    res.json({
+      id: client.id,
+      name: client.name,
+      email: client.email,
+      company: client.company
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Failed to get user', message: error.message });
+  }
+});
+
+// ==================== LEAD ENDPOINTS ====================
+
+// Get all leads for authenticated client
+app.get('/api/leads', authenticateToken, (req, res) => {
+  try {
+    const leads = leadOps.findByClientId.all(req.user.id);
+    res.json(leads);
+  } catch (error) {
+    console.error('Get leads error:', error);
+    res.status(500).json({ error: 'Failed to fetch leads', message: error.message });
+  }
+});
+
+// Get lead statistics
+app.get('/api/leads/stats', authenticateToken, (req, res) => {
+  try {
+    const stats = leadOps.getStats.get(req.user.id);
+    res.json(stats);
+  } catch (error) {
+    console.error('Get stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch stats', message: error.message });
+  }
+});
+
+// Get single lead
+app.get('/api/leads/:id', authenticateToken, (req, res) => {
+  try {
+    const lead = leadOps.findById.get(req.params.id);
+
+    if (!lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    // Ensure lead belongs to authenticated client
+    if (lead.client_id !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Get activities
+    const activities = activityOps.findByLeadId.all(lead.id);
+
+    res.json({ ...lead, activities });
+  } catch (error) {
+    console.error('Get lead error:', error);
+    res.status(500).json({ error: 'Failed to fetch lead', message: error.message });
+  }
+});
+
+// Create new lead
+app.post('/api/leads', authenticateToken, (req, res) => {
+  try {
+    const { name, email, phone, status, source, budget, notes } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Lead name is required' });
+    }
+
+    const result = leadOps.create.run(
+      req.user.id,
+      name,
+      email || '',
+      phone || '',
+      status || 'new',
+      source || '',
+      budget || '',
+      notes || ''
+    );
+
+    // Log activity
+    activityOps.create.run(
+      result.lastInsertRowid,
+      'created',
+      'Lead created'
+    );
+
+    const lead = leadOps.findById.get(result.lastInsertRowid);
+    res.status(201).json(lead);
+  } catch (error) {
+    console.error('Create lead error:', error);
+    res.status(500).json({ error: 'Failed to create lead', message: error.message });
+  }
+});
+
+// Update lead
+app.put('/api/leads/:id', authenticateToken, (req, res) => {
+  try {
+    const { name, email, phone, status, source, budget, notes } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Lead name is required' });
+    }
+
+    // Verify lead belongs to client
+    const existingLead = leadOps.findById.get(req.params.id);
+    if (!existingLead || existingLead.client_id !== req.user.id) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    leadOps.update.run(
+      name,
+      email || '',
+      phone || '',
+      status || 'new',
+      source || '',
+      budget || '',
+      notes || '',
+      req.params.id,
+      req.user.id
+    );
+
+    // Log activity if status changed
+    if (status !== existingLead.status) {
+      activityOps.create.run(
+        req.params.id,
+        'status_change',
+        `Status changed from ${existingLead.status} to ${status}`
+      );
+    }
+
+    const lead = leadOps.findById.get(req.params.id);
+    res.json(lead);
+  } catch (error) {
+    console.error('Update lead error:', error);
+    res.status(500).json({ error: 'Failed to update lead', message: error.message });
+  }
+});
+
+// Update lead status
+app.patch('/api/leads/:id/status', authenticateToken, (req, res) => {
+  try {
+    const { status } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+
+    // Verify lead belongs to client
+    const existingLead = leadOps.findById.get(req.params.id);
+    if (!existingLead || existingLead.client_id !== req.user.id) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    leadOps.updateStatus.run(status, req.params.id, req.user.id);
+
+    // Log activity
+    activityOps.create.run(
+      req.params.id,
+      'status_change',
+      `Status changed from ${existingLead.status} to ${status}`
+    );
+
+    const lead = leadOps.findById.get(req.params.id);
+    res.json(lead);
+  } catch (error) {
+    console.error('Update status error:', error);
+    res.status(500).json({ error: 'Failed to update status', message: error.message });
+  }
+});
+
+// Delete lead
+app.delete('/api/leads/:id', authenticateToken, (req, res) => {
+  try {
+    const result = leadOps.delete.run(req.params.id, req.user.id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    res.json({ message: 'Lead deleted successfully' });
+  } catch (error) {
+    console.error('Delete lead error:', error);
+    res.status(500).json({ error: 'Failed to delete lead', message: error.message });
+  }
+});
+
+// Add activity to lead
+app.post('/api/leads/:id/activities', authenticateToken, (req, res) => {
+  try {
+    const { activity_type, description } = req.body;
+
+    // Verify lead belongs to client
+    const lead = leadOps.findById.get(req.params.id);
+    if (!lead || lead.client_id !== req.user.id) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    const result = activityOps.create.run(
+      req.params.id,
+      activity_type || 'note',
+      description || ''
+    );
+
+    const activities = activityOps.findByLeadId.all(req.params.id);
+    res.status(201).json(activities);
+  } catch (error) {
+    console.error('Add activity error:', error);
+    res.status(500).json({ error: 'Failed to add activity', message: error.message });
+  }
+});
+
+// ==================== GZIP DECOMPRESSOR (LEGACY) ====================
+
 // Health Check
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'GZIP Decompressor läuft', 
-    usage: 'POST /decompress mit {base64: "..."} oder POST / mit {base64: "..."}' 
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'AI Agency Dashboard & GZIP Decompressor running',
+    version: '2.0.0'
   });
 });
 
@@ -102,7 +407,14 @@ app.post(['/', '/decompress'], (req, res) => {
   }
 });
 
+// Catch-all route to serve React app
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`GZIP Decompressor Server läuft auf Port ${PORT}`);
+  console.log(`AI Agency Dashboard Server running on port ${PORT}`);
+  console.log(`API available at http://localhost:${PORT}/api`);
+  console.log(`Dashboard available at http://localhost:${PORT}`);
 });
